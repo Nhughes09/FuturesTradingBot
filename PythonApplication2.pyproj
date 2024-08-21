@@ -1,47 +1,196 @@
-import os
-import google.generativeai as genai
+import pandas as pd
+import numpy as np
+import torch
+import json
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from torch.utils.data import DataLoader, TensorDataset
+import logging
 
-# Set your actual Gemini API key as an environment variable or in a secure configuration file
-api_key = "AIzaSyCP1STMYE5-lGAi8gbDKsvtXl68ITaf9wU"
-genai.configure(api_key=api_key)
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Create the model configuration
-generation_config = {
-    "temperature": 1,
-    "top_p": 0.95,
-    "top_k": 64,
-    "max_output_tokens": 8192,
-    "response_mime_type": "text/plain",
-}
+# Set random seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
 
-# Create the Gemini model
-model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
-    generation_config=generation_config,
-)
+# Load the datasets
+def load_datasets():
+    logging.info("Loading datasets...")
+    train_df = pd.read_csv("btc_kraken_5m_train.csv")
+    test_df = pd.read_csv("btc_kraken_5m_test.csv")
+    logging.info("Datasets loaded successfully.")
+    return train_df, test_df
 
-# Start a new chat session
-chat_session = model.start_chat(
-    history=[]
-)
+# Data Preprocessing
+def preprocess_data(df):
+    logging.info("Preprocessing data...")
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(df)
+    logging.info("Data preprocessing completed.")
+    return scaled_data, scaler
 
-# Function to get user input and send it to the chatbot
-def get_user_input():
-    return input("You: ")
+# Create sequences
+def create_sequences(data, seq_length):
+    logging.info("Creating sequences...")
+    xs, ys = [], []
+    for i in range(len(data) - seq_length):
+        x = data[i:(i + seq_length)]
+        y = data[i + seq_length]
+        xs.append(x)
+        ys.append(y)
+    logging.info("Sequences created successfully.")
+    return np.array(xs), np.array(ys)
 
-# Main chatbot interaction loop
+# LSTM Model
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, output_dim):
+        super(LSTMModel, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
+        out, _ = self.lstm(x, (h0, c0))
+        out = self.fc(out[:, -1, :])
+        return out
+
+# Train the model
+def train_model(model, train_loader, criterion, optimizer, num_epochs):
+    logging.info("Training model...")
+    model.train()
+    for epoch in range(num_epochs):
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+        logging.info(f'Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}')
+    logging.info("Model training completed.")
+
+# Evaluate the model
+def evaluate_model(model, test_loader, scaler):
+    logging.info("Evaluating model...")
+    model.eval()
+    predictions = []
+    actuals = []
+    with torch.no_grad():
+        for inputs, targets in test_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            predictions.append(outputs.cpu().numpy())
+            actuals.append(targets.cpu().numpy())
+    predictions = np.vstack(predictions)
+    actuals = np.vstack(actuals)
+    predictions = scaler.inverse_transform(predictions)
+    actuals = scaler.inverse_transform(actuals)
+    logging.info("Model evaluation completed.")
+    return predictions, actuals
+
+# Calculate metrics
+def calculate_metrics(actuals, predictions):
+    logging.info("Calculating metrics...")
+    mae = mean_absolute_error(actuals, predictions)
+    rmse = np.sqrt(mean_squared_error(actuals, predictions))
+    mape = np.mean(np.abs((actuals - predictions) / actuals)) * 100
+    logging.info(f'MAE: {mae}, RMSE: {rmse}, MAPE: {mape}%')
+    return mae, rmse, mape
+
+# Hyperparameter tuning
+def hyperparameter_tuning(train_data, train_labels, test_data, test_labels, scaler):
+    logging.info("Starting hyperparameter tuning...")
+    best_loss = float('inf')
+    best_params = {}
+    for hidden_dim in [32, 64, 128]:
+        for num_layers in [1, 2, 3]:
+            for learning_rate in [0.001, 0.01, 0.1]:
+                logging.info(f"Trying hyperparameters: hidden_dim={hidden_dim}, num_layers={num_layers}, learning_rate={learning_rate}")
+                model = LSTMModel(input_dim=train_data.shape[2], hidden_dim=hidden_dim, num_layers=num_layers, output_dim=5).to(device)
+                criterion = nn.MSELoss()
+                optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+                train_loader = DataLoader(TensorDataset(train_data, train_labels), batch_size=64, shuffle=True)
+                train_model(model, train_loader, criterion, optimizer, num_epochs=50)
+                test_loader = DataLoader(TensorDataset(test_data, test_labels), batch_size=64, shuffle=False)
+                predictions, actuals = evaluate_model(model, test_loader, scaler)
+                loss = mean_squared_error(actuals, predictions)
+                if loss < best_loss:
+                    best_loss = loss
+                    best_params = {'hidden_dim': hidden_dim, 'num_layers': num_layers, 'learning_rate': learning_rate}
+    logging.info("Hyperparameter tuning completed.")
+    return best_params
+import json
+import numpy as np
+
+# Main function
 def main():
-    print("Welcome to the Gemini Chatbot!")
-    print("Type 'quit' at any time to end the conversation.")
-
-    while True:
-        user_input = get_user_input()
-
-        if user_input.lower() == "quit":
-            break
-
-        response = chat_session.send_message(user_input)
-        print("Bot:", response.text)
+    train_df, test_df = load_datasets()
+    train_data, train_scaler = preprocess_data(train_df[['open', 'high', 'low', 'close', 'volume']])
+    test_data, _ = preprocess_data(test_df[['open', 'high', 'low', 'close', 'volume']])
+    
+    seq_length = 100
+    train_X, train_y = create_sequences(train_data, seq_length)
+    test_X, test_y = create_sequences(test_data, seq_length)
+    
+    train_X_tensor = torch.tensor(train_X, dtype=torch.float32).to(device)
+    train_y_tensor = torch.tensor(train_y, dtype=torch.float32).to(device)
+    test_X_tensor = torch.tensor(test_X, dtype=torch.float32).to(device)
+    test_y_tensor = torch.tensor(test_y, dtype=torch.float32).to(device)
+    
+    best_params = hyperparameter_tuning(train_X_tensor, train_y_tensor, test_X_tensor, test_y_tensor, train_scaler)
+    
+    model = LSTMModel(input_dim=train_X.shape[2], hidden_dim=best_params['hidden_dim'], num_layers=best_params['num_layers'], output_dim=5).to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=best_params['learning_rate'])
+    train_loader = DataLoader(TensorDataset(train_X_tensor, train_y_tensor), batch_size=64, shuffle=True)
+    train_model(model, train_loader, criterion, optimizer, num_epochs=50)
+    
+    test_loader = DataLoader(TensorDataset(test_X_tensor, test_y_tensor), batch_size=64, shuffle=False)
+    predictions, actuals = evaluate_model(model, test_loader, train_scaler)
+    
+    mae, rmse, mape = calculate_metrics(actuals, predictions)
+    
+    # Save the model and predictions
+    torch.save(model.state_dict(), 'lstm_model.pth')
+    np.save('predictions.npy', predictions)
+    
+    # Generate a report
+    plt.figure(figsize=(12, 6))
+    for i in range(5):
+        plt.plot(actuals[:, i], label=f'Actual {train_df.columns[i+1]}')
+        plt.plot(predictions[:, i], label=f'Predicted {train_df.columns[i+1]}')
+    plt.legend()
+    plt.title('Actual vs Predicted Prices')
+    plt.xlabel('Time')
+    plt.ylabel('Price')
+    plt.savefig('actual_vs_predicted_prices.png')
+    plt.show()
+    
+    # Convert numpy floats to standard floats for JSON serialization
+    output_data = {
+        "Model Performance Report": {
+            "Mean Absolute Error": float(mae),
+            "Root Mean Squared Error": float(rmse),
+            "Mean Absolute Percentage Error": float(mape)
+        },
+        "Optimized Hyperparameters": {
+            "Hidden Dimension": best_params['hidden_dim'],
+            "Number of Layers": best_params['num_layers'],
+            "Learning Rate": best_params['learning_rate']
+        }
+    }
+    
+    with open('report.json', 'w') as f:
+        json.dump(output_data, f, indent=4)
 
 if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     main()
